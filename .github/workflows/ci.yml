@@ -11,5 +11,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: command -v jq || brew install jq
-      - run: bash -n herdr-open
+      - run: bash -n herdr-open && bash -n herdr-open-relay
       - run: bash tests/test.sh

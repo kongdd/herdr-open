@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Prevent Git Bash from rewriting remote POSIX paths passed to native CLIs.
+export MSYS_NO_PATHCONV=1
+
+fail() {
+    printf 'herdr-open-relay: %s\n' "$*" >&2
+    exit 1
+}
+
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+    printf '%s\n' 'herdr-open-relay HOST'
+    exit 0
+fi
+[[ $# == 1 ]] || fail 'usage: herdr-open-relay HOST'
+open_script=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/herdr-open
+
+relay() {
+    local host=$1 dir ssh_pid='' reader_pid='' n=0
+    local message fields ed path
+    [[ $host =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.@-]*$ ]] ||
+        fail 'use an SSH config alias or user@host'
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/herdr-open.XXXXXX")
+
+    cleanup() {
+        local timer
+        if [[ -n $ssh_pid ]]; then
+            # Let the remote shell remove its FIFO before closing the SSH stream.
+            printf '\n' >&3 || :
+            (sleep 3; kill "$ssh_pid" 2>/dev/null || :) &
+            timer=$!
+            wait "$ssh_pid" 2>/dev/null || :
+            kill "$timer" 2>/dev/null || :
+            wait "$timer" 2>/dev/null || :
+        fi
+        [[ -z $reader_pid ]] || kill "$reader_pid" 2>/dev/null || :
+        [[ -z $reader_pid ]] || wait "$reader_pid" 2>/dev/null || :
+        exec 3>&-
+        rm -rf "$dir"
+    }
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    mkfifo "$dir/messages" "$dir/control"
+    exec 3<> "$dir/control"
+
+    # Remote FIFO permissions replace TCP tokens. One relay per remote user.
+    # A pipe also works with native Windows SSH, which cannot read an MSYS FIFO directly.
+    ssh -T -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "$host" 'bash -c '\''
+set -eu
+umask 077
+# Non-interactive SSH shells may omit Homebrew and user-installed binaries.
+export PATH="$PATH:$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin"
+d=$(herdr plugin config-dir kongdd.open)/relay
+pump=""
+mkdir "$d" || {
+    echo "herdr-open-relay: relay already exists; see docs/maintenance.md" >&2
+    exit 1
+}
+cleanup() {
+    if [ -n "$pump" ]; then
+        kill "$pump" 2>/dev/null || :
+        wait "$pump" 2>/dev/null || :
+    fi
+    rm -f "$d/requests"
+    rmdir "$d"
+}
+trap cleanup EXIT
+trap "exit 1" HUP INT TERM
+mkfifo "$d/requests"
+exec 3<> "$d/requests"
+(
+    while IFS= read -r line <&3; do
+        printf "%s\n" "$line"
+    done
+) &
+pump=$!
+printf "{\"ready\":true}\n"
+# A stop line or SSH stdin EOF ends the relay even when the request FIFO is idle.
+IFS= read -r stop || :
+'\''' > "$dir/messages" < <(IFS= read -r stop <&3; printf '\n') 3<&- &
+    ssh_pid=$!
+
+    (
+        while IFS= read -r message; do
+            if [[ $message == '{"ready":true}' ]]; then
+                touch "$dir/ready"
+                continue
+            fi
+            fields=$(jq -er '
+                [.editor,.path]
+                | select(all(.[];
+                    type == "string" and (test("[\u0000-\u001f\u007f]") | not)
+                ))
+                | .[]
+            ' <<< "$message") || continue
+            # Windows jq emits CRLF; validation above excludes CR inside fields.
+            fields=${fields//$'\r'/}
+            ed=${fields%%$'\n'*}
+            path=${fields#*$'\n'}
+            # Isolate validation/CLI failures so one bad request does not stop relay.
+            (bash "$open_script" remote "$ed" "$host" "$path" < /dev/null) ||
+                printf 'herdr-open-relay: failed to open workspace\n' >&2
+        done < "$dir/messages"
+    ) &
+    reader_pid=$!
+
+    until [[ -f $dir/ready ]]; do
+        kill -0 "$ssh_pid" 2>/dev/null || fail 'SSH relay setup failed'
+        n=$((n + 1))
+        [[ $n -lt 300 ]] || fail 'SSH relay setup timed out'
+        sleep 0.1
+    done
+    printf 'herdr-open-relay: relay ready for %s\n' "$host" >&2
+    wait "$ssh_pid" || :
+    fail 'SSH relay disconnected; restart herdr-open-relay HOST'
+}
+
+relay "$1"
