@@ -1,96 +1,199 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-fail() { printf 'herdr-open: %s\n' "$*" >&2; exit 1; }
-editor() { [[ $1 == zed || $1 == code ]] || fail 'editor must be zed or code'; }
-path_valid() { [[ $1 == /* && ! $1 =~ [[:cntrl:]] ]] || fail 'expected an absolute path without control characters'; }
-host_valid() { [[ $1 =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.@-]*$ ]] || fail 'use an SSH config alias or user@host'; }
+fail() {
+    printf 'herdr-open: %s\n' "$*" >&2
+    exit 1
+}
+
+editor() {
+    [[ $1 == zed || $1 == code ]] || fail 'editor must be zed or code'
+}
+
+path_valid() {
+    [[ $1 == /* && ! $1 =~ [[:cntrl:]] ]] ||
+        fail 'expected an absolute path without control characters'
+}
+
+host_valid() {
+    [[ $1 =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.@-]*$ ]] ||
+        fail 'use an SSH config alias or user@host'
+}
+
 launch() {
     local ed=$1 host=$2 path=$3 bin
-    editor "$ed"; path_valid "$path"
+    editor "$ed"
+    path_valid "$path"
     [[ -z $host ]] || host_valid "$host"
+
     case $ed in
-        zed) bin=${HERDR_OPEN_ZED_BIN:-zed}
-             [[ -z $host ]] || path="ssh://$host$(jq -rn --arg p "$path" '$p | split("/") | map(@uri) | join("/")')"
-             "$bin" "$path" ;;
-        code) bin=${HERDR_OPEN_CODE_BIN:-code}
-              if [[ -n $host ]]; then "$bin" --remote "ssh-remote+$host" "$path"; else "$bin" "$path"; fi ;;
+        zed)
+            bin=${HERDR_OPEN_ZED_BIN:-zed}
+            if [[ -n $host ]]; then
+                path="ssh://$host$(jq -rn --arg p "$path" '
+                    $p | split("/") | map(@uri) | join("/")
+                ')"
+            fi
+            "$bin" "$path"
+            ;;
+        code)
+            bin=${HERDR_OPEN_CODE_BIN:-code}
+            if [[ -n $host ]]; then
+                "$bin" --remote "ssh-remote+$host" "$path"
+            else
+                "$bin" "$path"
+            fi
+            ;;
     esac
 }
+
 request() {
     local ed=$1 path fifo message writer timer status=0
     editor "$ed"
-    path=$(jq -er '[.worktree.checkout_path, .workspace_cwd, .focused_pane_cwd] | map(select(type == "string" and length > 0)) | first' <<< "${HERDR_PLUGIN_CONTEXT_JSON:?run through a Herdr plugin action}")
+    path=$(jq -er '
+        [.worktree.checkout_path, .workspace_cwd, .focused_pane_cwd]
+        | map(select(type == "string" and length > 0))
+        | first
+    ' <<< "${HERDR_PLUGIN_CONTEXT_JSON:?run through a Herdr plugin action}")
     path_valid "$path"
     fifo=${HERDR_PLUGIN_CONFIG_DIR:?}/relay/requests
-    if [[ -p $fifo ]]; then
-        message=$(jq -cn --arg editor "$ed" --arg path "$path" '{editor:$editor,path:$path}')
-        # Stay below POSIX PIPE_BUF so simultaneous writes cannot interleave.
-        [[ $(LC_ALL=C printf '%s\n' "$message" | wc -c) -le 512 ]] || fail 'remote request exceeds 512 bytes'
-        (printf '%s\n' "$message" > "$fifo") & writer=$!
-        (sleep 3; kill "$writer" 2>/dev/null || :) & timer=$!
-        wait "$writer" || status=$?
-        kill "$timer" 2>/dev/null || :; wait "$timer" 2>/dev/null || :
-        [[ $status == 0 ]] || fail 'relay unavailable; reconnect with herdr-open attach HOST' 
-    else
-        [[ -z ${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-} ]] || fail 'remote session needs herdr-open attach HOST'
+
+    if [[ ! -p $fifo ]]; then
+        [[ -z ${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-} ]] ||
+            fail 'remote session needs herdr-open attach HOST'
         launch "$ed" '' "$path"
+        return
     fi
+
+    message=$(jq -cn --arg editor "$ed" --arg path "$path" '{editor:$editor,path:$path}')
+    # Stay below POSIX PIPE_BUF so simultaneous writes cannot interleave.
+    [[ $(LC_ALL=C printf '%s\n' "$message" | wc -c) -le 512 ]] ||
+        fail 'remote request exceeds 512 bytes'
+
+    (printf '%s\n' "$message" > "$fifo") &
+    writer=$!
+    (sleep 3; kill "$writer" 2>/dev/null || :) &
+    timer=$!
+    wait "$writer" || status=$?
+    kill "$timer" 2>/dev/null || :
+    wait "$timer" 2>/dev/null || :
+    [[ $status == 0 ]] || fail 'relay unavailable; reconnect with herdr-open attach HOST'
 }
+
 attach() {
-    local status host=$1 dir ssh_pid='' reader_pid='' n=0
-    shift; host_valid "$host"
+    local host=$1 dir status ssh_pid='' reader_pid='' n=0
+    local message fields ed path
+    shift
+    host_valid "$host"
     [[ ${1:-} != -- ]] || shift
     dir=$(mktemp -d "${TMPDIR:-/tmp}/herdr-open.XXXXXX")
+
     cleanup() {
         local pid
-        for pid in "$ssh_pid" "$reader_pid"; do [[ -z $pid ]] || kill "$pid" 2>/dev/null || :; done
-        for pid in "$ssh_pid" "$reader_pid"; do [[ -z $pid ]] || wait "$pid" 2>/dev/null || :; done
+        for pid in "$ssh_pid" "$reader_pid"; do
+            [[ -z $pid ]] || kill "$pid" 2>/dev/null || :
+        done
+        for pid in "$ssh_pid" "$reader_pid"; do
+            [[ -z $pid ]] || wait "$pid" 2>/dev/null || :
+        done
         rm -rf "$dir"
     }
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
     mkfifo "$dir/messages"
+
     # Remote FIFO permissions replace TCP tokens. One attachment per remote user.
     ssh -T -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "$host" 'bash -c '\''
 set -eu
 umask 077
 d=$(herdr plugin config-dir kongdd.open)/relay
-mkdir "$d" || { echo "herdr-open: relay already exists; see README recovery instructions" >&2; exit 1; }
-cleanup() { rm -f "$d/requests"; rmdir "$d"; }
+mkdir "$d" || {
+    echo "herdr-open: relay already exists; see README recovery instructions" >&2
+    exit 1
+}
+cleanup() {
+    rm -f "$d/requests"
+    rmdir "$d"
+}
 trap cleanup EXIT
 trap "exit 1" HUP INT TERM
 mkfifo "$d/requests"
 exec 3<> "$d/requests"
 printf "{\"ready\":true}\n"
-while IFS= read -r line <&3; do printf "%s\n" "$line"; done
-'\''' > "$dir/messages" < /dev/null & ssh_pid=$!
+while IFS= read -r line <&3; do
+    printf "%s\n" "$line"
+done
+'\''' > "$dir/messages" < /dev/null &
+    ssh_pid=$!
+
     (
         while IFS= read -r message; do
-            if [[ $message == '{"ready":true}' ]]; then touch "$dir/ready"; continue; fi
-            fields=$(jq -er '[.editor,.path] | select(all(.[]; type == "string" and (test("[\u0000-\u001f\u007f]") | not))) | .[]' <<< "$message") || continue
-            ed=${fields%%$'\n'*}; path=${fields#*$'\n'}
+            if [[ $message == '{"ready":true}' ]]; then
+                touch "$dir/ready"
+                continue
+            fi
+            fields=$(jq -er '
+                [.editor,.path]
+                | select(all(.[];
+                    type == "string" and (test("[\u0000-\u001f\u007f]") | not)
+                ))
+                | .[]
+            ' <<< "$message") || continue
+            # Windows jq emits CRLF; validation above excludes CR inside fields.
+            fields=${fields//$'\r'/}
+            ed=${fields%%$'\n'*}
+            path=${fields#*$'\n'}
             # Isolate validation/CLI failures so one bad request does not stop relay.
-            (launch "$ed" "$host" "$path" < /dev/null) || printf 'herdr-open: failed to open workspace\n' >&2
+            (launch "$ed" "$host" "$path" < /dev/null) ||
+                printf 'herdr-open: failed to open workspace\n' >&2
         done < "$dir/messages"
-    ) & reader_pid=$!
+    ) &
+    reader_pid=$!
+
     until [[ -f $dir/ready ]]; do
         kill -0 "$ssh_pid" 2>/dev/null || fail 'SSH relay setup failed'
-        n=$((n + 1)); [[ $n -lt 300 ]] || fail 'SSH relay setup timed out'
+        n=$((n + 1))
+        [[ $n -lt 300 ]] || fail 'SSH relay setup timed out'
         sleep 0.1
     done
     printf 'herdr-open: relay ready for %s\n' "$host" >&2
-    if "${HERDR_OPEN_HERDR_BIN:-herdr}" --remote "$host" --remote-keybindings server "$@"; then status=0; else status=$?; fi
+    if "${HERDR_OPEN_HERDR_BIN:-herdr}" --remote "$host" --remote-keybindings server "$@"; then
+        status=0
+    else
+        status=$?
+    fi
     cleanup
     trap - EXIT INT TERM HUP
     return "$status"
 }
+
 case ${1:---help} in
-    open) [[ $# == 2 ]] || fail 'usage: herdr-open open zed|code'; request "$2" ;;
-    local) [[ $# == 3 ]] || fail 'usage: herdr-open local zed|code /path'; launch "$2" '' "$3" ;;
-    remote) [[ $# == 4 ]] || fail 'usage: herdr-open remote zed|code HOST /path'; launch "$2" "$3" "$4" ;;
-    attach) [[ $# -ge 2 ]] || fail 'usage: herdr-open attach HOST [-- HERDR_ARGS...]'; shift; attach "$@" ;;
-    --help|-h) printf '%s\n' 'herdr-open open zed|code' 'herdr-open local zed|code /path' 'herdr-open remote zed|code HOST /path' 'herdr-open attach HOST [-- HERDR_ARGS...]' ;;
-    *) fail 'invalid arguments; run herdr-open --help' ;;
+    open)
+        [[ $# == 2 ]] || fail 'usage: herdr-open open zed|code'
+        request "$2"
+        ;;
+    local)
+        [[ $# == 3 ]] || fail 'usage: herdr-open local zed|code /path'
+        launch "$2" '' "$3"
+        ;;
+    remote)
+        [[ $# == 4 ]] || fail 'usage: herdr-open remote zed|code HOST /path'
+        launch "$2" "$3" "$4"
+        ;;
+    attach)
+        [[ $# -ge 2 ]] || fail 'usage: herdr-open attach HOST [-- HERDR_ARGS...]'
+        shift
+        attach "$@"
+        ;;
+    --help|-h)
+        printf '%s\n' \
+            'herdr-open open zed|code' \
+            'herdr-open local zed|code /path' \
+            'herdr-open remote zed|code HOST /path' \
+            'herdr-open attach HOST [-- HERDR_ARGS...]'
+        ;;
+    *)
+        fail 'invalid arguments; run herdr-open --help'
+        ;;
 esac
